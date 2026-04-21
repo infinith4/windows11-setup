@@ -52,7 +52,9 @@ namespace ExplorerCopyTab
         public const ushort VK_L = 0x4C;
         public const ushort VK_T = 0x54;
         public const ushort VK_A = 0x41;
+        public const ushort VK_C = 0x43;
         public const ushort VK_D = 0x44;
+        public const ushort VK_ESCAPE = 0x1B;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct MSG
@@ -419,6 +421,118 @@ function Wait-ForWindowForeground {
     return $false
 }
 
+function Get-ActiveExplorerNavigationTarget {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context
+    )
+
+    $clipboardBackup = $null
+    $clipboardHadText = $false
+    $sentinel = "__explorer_copytab__{0}" -f ([guid]::NewGuid().ToString("N"))
+
+    try {
+        try {
+            $clipboardBackup = Get-Clipboard -Raw -Format Text
+            $clipboardHadText = $true
+        }
+        catch {
+            $clipboardBackup = $null
+            $clipboardHadText = $false
+        }
+
+        Set-Clipboard -Value $sentinel
+        Start-Sleep -Milliseconds 50
+
+        $ctrlLResult = [ExplorerCopyTab.NativeMethods]::SendModifiedKeyPress(
+            [ExplorerCopyTab.NativeMethods]::VK_CONTROL,
+            [ExplorerCopyTab.NativeMethods]::VK_L
+        )
+        if ($ctrlLResult -eq 0) {
+            $ctrlLError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Log "Capture source Ctrl+L result=0 Win32Error=$ctrlLError"
+        }
+        else {
+            Write-Log "Capture source Ctrl+L result=$ctrlLResult (expected 4)"
+        }
+
+        Start-Sleep -Milliseconds $AddressBarDelayMs
+
+        $ctrlAResult = [ExplorerCopyTab.NativeMethods]::SendModifiedKeyPress(
+            [ExplorerCopyTab.NativeMethods]::VK_CONTROL,
+            [ExplorerCopyTab.NativeMethods]::VK_A
+        )
+        if ($ctrlAResult -eq 0) {
+            $ctrlAError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Log "Capture source Ctrl+A result=0 Win32Error=$ctrlAError"
+        }
+        else {
+            Write-Log "Capture source Ctrl+A result=$ctrlAResult (expected 4)"
+        }
+
+        Start-Sleep -Milliseconds 80
+
+        $ctrlCResult = [ExplorerCopyTab.NativeMethods]::SendModifiedKeyPress(
+            [ExplorerCopyTab.NativeMethods]::VK_CONTROL,
+            [ExplorerCopyTab.NativeMethods]::VK_C
+        )
+        if ($ctrlCResult -eq 0) {
+            $ctrlCError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Log "Capture source Ctrl+C result=0 Win32Error=$ctrlCError"
+        }
+        else {
+            Write-Log "Capture source Ctrl+C result=$ctrlCResult (expected 4)"
+        }
+
+        $capturedText = $null
+        $clipboardWait = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($clipboardWait.ElapsedMilliseconds -lt 1000) {
+            try {
+                $capturedText = Get-Clipboard -Raw -Format Text
+            }
+            catch {
+                $capturedText = $null
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($capturedText) -and $capturedText -ne $sentinel) {
+                break
+            }
+
+            Start-Sleep -Milliseconds 50
+        }
+
+        [void][ExplorerCopyTab.NativeMethods]::SendKeyPress([ExplorerCopyTab.NativeMethods]::VK_ESCAPE)
+        Start-Sleep -Milliseconds 50
+
+        if (-not [string]::IsNullOrWhiteSpace($capturedText) -and $capturedText -ne $sentinel) {
+            $normalized = $capturedText.Trim()
+            Write-Log "Captured active tab target from UI: $normalized"
+            return $normalized
+        }
+
+        Write-Log "Failed to capture active tab target from UI. ClipboardText=$capturedText Falling back to COM path=$($Context.Path)"
+        return $Context.Path
+    }
+    finally {
+        if ($clipboardHadText) {
+            try {
+                Set-Clipboard -Value $clipboardBackup
+            }
+            catch {
+                Write-Log "Clipboard restore failed after capture: $_"
+            }
+        }
+        else {
+            try {
+                Set-Clipboard -Value ""
+            }
+            catch {
+                Write-Log "Clipboard clear failed after capture: $_"
+            }
+        }
+    }
+}
+
 function Invoke-ExplorerTabClone {
     param(
         [Parameter(Mandatory)]
@@ -432,6 +546,9 @@ function Invoke-ExplorerTabClone {
     $foregroundReady = Wait-ForWindowForeground -Hwnd $Context.Hwnd
     Write-Log "Foreground request result=$foregroundSet ready=$foregroundReady"
     Start-Sleep -Milliseconds 180
+
+    $navigationTarget = Get-ActiveExplorerNavigationTarget -Context $Context
+    Write-Log "Using navigation target: $navigationTarget"
 
     $windowsBefore = @(Get-ExplorerWindowsForHwnd -Hwnd $Context.Hwnd)
     Write-Log "Explorer windows before Ctrl+T count=$($windowsBefore.Count)"
@@ -479,8 +596,8 @@ function Invoke-ExplorerTabClone {
     }
     else {
         try {
-            $targetWindowInfo.Window.Navigate2($Context.Path)
-            Write-Log "Navigate2 invoked for path=$($Context.Path)"
+            $targetWindowInfo.Window.Navigate2($navigationTarget)
+            Write-Log "Navigate2 invoked for path=$navigationTarget"
         }
         catch {
             Write-Log "Navigate2 failed: $_"
