@@ -2,6 +2,8 @@ param(
     [string]$HotKey = "Ctrl+Alt+Shift+D",
     [int]$NewTabDelayMs = 450,
     [int]$AddressBarDelayMs = 150,
+    [int]$PostNewTabSettleDelayMs = 250,
+    [int]$PostEnterVerifyDelayMs = 500,
     [int]$RunOnceWaitMs = 5000,
     [string]$LogPath = "",
     [switch]$RunOnce
@@ -50,6 +52,7 @@ namespace ExplorerCopyTab
         public const ushort VK_L = 0x4C;
         public const ushort VK_T = 0x54;
         public const ushort VK_A = 0x41;
+        public const ushort VK_D = 0x44;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct MSG
@@ -80,7 +83,22 @@ namespace ExplorerCopyTab
         public struct InputUnion
         {
             [FieldOffset(0)]
+            public MOUSEINPUT mi;
+            [FieldOffset(0)]
             public KEYBDINPUT ki;
+            [FieldOffset(0)]
+            public HARDWAREINPUT hi;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MOUSEINPUT
+        {
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -93,6 +111,14 @@ namespace ExplorerCopyTab
             public IntPtr dwExtraInfo;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct HARDWAREINPUT
+        {
+            public uint uMsg;
+            public ushort wParamL;
+            public ushort wParamH;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
@@ -101,6 +127,9 @@ namespace ExplorerCopyTab
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern sbyte GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+        [DllImport("user32.dll")]
+        public static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
@@ -129,20 +158,16 @@ namespace ExplorerCopyTab
             MSG message;
             while (true)
             {
-                sbyte result = GetMessage(out message, IntPtr.Zero, 0, 0);
-                if (result == 0)
+                if (PeekMessage(out message, IntPtr.Zero, 0, 0, 1))
                 {
-                    return 0;
+                    if (message.message == 0x0012) // WM_QUIT
+                        return 0;
+                    if (message.message == WM_HOTKEY)
+                        return unchecked((int)message.wParam.ToUInt32());
                 }
-
-                if (result == -1)
+                else
                 {
-                    return -1;
-                }
-
-                if (message.message == WM_HOTKEY)
-                {
-                    return unchecked((int)message.wParam.ToUInt32());
+                    System.Threading.Thread.Sleep(50);
                 }
             }
         }
@@ -205,6 +230,18 @@ namespace ExplorerCopyTab
                 CreateVirtualKeyInput(modifier, true)
             };
             return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        }
+
+        public static void ReleaseModifierKeys()
+        {
+            var inputs = new[]
+            {
+                CreateVirtualKeyInput(VK_CONTROL, true),
+                CreateVirtualKeyInput(VK_MENU, true),
+                CreateVirtualKeyInput(VK_SHIFT, true),
+                CreateVirtualKeyInput(VK_LWIN, true),
+            };
+            SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
         }
 
         public static uint SendUnicodeText(string text)
@@ -296,7 +333,6 @@ function Get-ActiveExplorerContext {
                 Hwnd = $hwnd
                 Path = $path
                 Title = [string]$window.LocationName
-                Window = $window
             }
         }
         catch {
@@ -305,6 +341,44 @@ function Get-ActiveExplorerContext {
     }
 
     return $null
+}
+
+function Get-ExplorerWindowsForHwnd {
+    param(
+        [Parameter(Mandatory)]
+        [IntPtr]$Hwnd
+    )
+
+    $shell = New-Object -ComObject Shell.Application
+    $matches = @()
+    foreach ($window in @($shell.Windows())) {
+        try {
+            $windowHandle = [IntPtr]::new([int64]$window.HWND)
+            if ($windowHandle -ne $Hwnd) {
+                continue
+            }
+
+            $path = $null
+            try {
+                $path = $window.Document.Folder.Self.Path
+            }
+            catch {
+                $path = $null
+            }
+
+            $matches += [pscustomobject]@{
+                Hwnd = $windowHandle
+                Path = [string]$path
+                Title = [string]$window.LocationName
+                Window = $window
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $matches
 }
 
 function Wait-ForActiveExplorerContext {
@@ -326,90 +400,110 @@ function Wait-ForActiveExplorerContext {
     return $null
 }
 
+function Wait-ForWindowForeground {
+    param(
+        [Parameter(Mandatory)]
+        [IntPtr]$Hwnd,
+        [int]$TimeoutMs = 800
+    )
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($stopwatch.ElapsedMilliseconds -lt $TimeoutMs) {
+        if ([ExplorerCopyTab.NativeMethods]::GetForegroundWindow() -eq $Hwnd) {
+            return $true
+        }
+
+        Start-Sleep -Milliseconds 40
+    }
+
+    return $false
+}
+
 function Invoke-ExplorerTabClone {
     param(
         [Parameter(Mandatory)]
         [pscustomobject]$Context
     )
 
-    if ($null -ne $Context.Window) {
-        try {
-            Write-Log "Trying COM Navigate2 new-tab for path=$($Context.Path)"
-            $Context.Window.Navigate2($Context.Path, 65536)
-            Write-Log "COM Navigate2 accepted navOpenNewForegroundTab."
-            return
-        }
-        catch {
-            Write-Log "COM Navigate2 navOpenNewForegroundTab failed: $($_.Exception.Message)"
-        }
+    [ExplorerCopyTab.NativeMethods]::ReleaseModifierKeys()
+    Start-Sleep -Milliseconds 30
+    $foregroundSet = [ExplorerCopyTab.NativeMethods]::SetForegroundWindow($Context.Hwnd)
+    Write-Log "Invoking clone for hwnd=$($Context.Hwnd.ToInt64()) path=$($Context.Path)"
+    $foregroundReady = Wait-ForWindowForeground -Hwnd $Context.Hwnd
+    Write-Log "Foreground request result=$foregroundSet ready=$foregroundReady"
+    Start-Sleep -Milliseconds 180
 
-        try {
-            Write-Log "Trying COM Navigate2 open-in-new-tab for path=$($Context.Path)"
-            $Context.Window.Navigate2($Context.Path, 2048)
-            Write-Log "COM Navigate2 accepted navOpenInNewTab."
-            return
-        }
-        catch {
-            Write-Log "COM Navigate2 navOpenInNewTab failed: $($_.Exception.Message)"
-        }
-    }
+    $windowsBefore = @(Get-ExplorerWindowsForHwnd -Hwnd $Context.Hwnd)
+    Write-Log "Explorer windows before Ctrl+T count=$($windowsBefore.Count)"
 
-    [void][ExplorerCopyTab.NativeMethods]::SetForegroundWindow($Context.Hwnd)
-    Write-Log "Invoking SendInput fallback for hwnd=$($Context.Hwnd.ToInt64()) path=$($Context.Path)"
-    Start-Sleep -Milliseconds 120
-
-    [void][ExplorerCopyTab.NativeMethods]::SendModifiedKeyPress(
+    Write-Log "Sending Ctrl+T"
+    $ctrlTResult = [ExplorerCopyTab.NativeMethods]::SendModifiedKeyPress(
         [ExplorerCopyTab.NativeMethods]::VK_CONTROL,
         [ExplorerCopyTab.NativeMethods]::VK_T
     )
+    if ($ctrlTResult -eq 0) {
+        $ctrlTError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Log "Ctrl+T SendInput result=0 Win32Error=$ctrlTError"
+    }
+    else {
+        Write-Log "Ctrl+T SendInput result=$ctrlTResult (expected 4)"
+    }
     Start-Sleep -Milliseconds $NewTabDelayMs
+    if ($PostNewTabSettleDelayMs -gt 0) {
+        Start-Sleep -Milliseconds $PostNewTabSettleDelayMs
+    }
+    Write-Log "Post Ctrl+T wait complete delay=$NewTabDelayMs settle=$PostNewTabSettleDelayMs"
 
-    [void][ExplorerCopyTab.NativeMethods]::SendModifiedKeyPress(
-        [ExplorerCopyTab.NativeMethods]::VK_CONTROL,
-        [ExplorerCopyTab.NativeMethods]::VK_L
-    )
-    Start-Sleep -Milliseconds $AddressBarDelayMs
+    $windowsAfter = @(Get-ExplorerWindowsForHwnd -Hwnd $Context.Hwnd)
+    Write-Log "Explorer windows after Ctrl+T count=$($windowsAfter.Count)"
 
-    $clipboardBackup = $null
-    $clipboardHadText = $false
-    try {
+    $targetWindowInfo = $null
+    if ($windowsAfter.Count -gt $windowsBefore.Count) {
+        $targetWindowInfo = $windowsAfter[-1]
+        Write-Log "Selected newest Explorer window entry after Ctrl+T title=$($targetWindowInfo.Title) path=$($targetWindowInfo.Path)"
+    }
+    else {
+        $blankPathWindow = $windowsAfter | Where-Object { [string]::IsNullOrWhiteSpace($_.Path) } | Select-Object -First 1
+        if ($null -ne $blankPathWindow) {
+            $targetWindowInfo = $blankPathWindow
+            Write-Log "Selected blank-path Explorer window entry title=$($targetWindowInfo.Title)"
+        }
+        elseif ($windowsAfter.Count -gt 0) {
+            $targetWindowInfo = $windowsAfter[-1]
+            Write-Log "Falling back to last Explorer window entry title=$($targetWindowInfo.Title) path=$($targetWindowInfo.Path)"
+        }
+    }
+
+    if ($null -eq $targetWindowInfo) {
+        Write-Log "No Explorer navigation target found after Ctrl+T."
+    }
+    else {
         try {
-            $clipboardBackup = Get-Clipboard -Raw -Format Text
-            $clipboardHadText = $true
+            $targetWindowInfo.Window.Navigate2($Context.Path)
+            Write-Log "Navigate2 invoked for path=$($Context.Path)"
         }
         catch {
-            $clipboardBackup = $null
-            $clipboardHadText = $false
-        }
-
-        Set-Clipboard -Value $Context.Path
-        Start-Sleep -Milliseconds 50
-        [void][ExplorerCopyTab.NativeMethods]::SendModifiedKeyPress(
-            [ExplorerCopyTab.NativeMethods]::VK_CONTROL,
-            [ExplorerCopyTab.NativeMethods]::VK_A
-        )
-        Start-Sleep -Milliseconds 30
-        [void][ExplorerCopyTab.NativeMethods]::SendModifiedKeyPress(
-            [ExplorerCopyTab.NativeMethods]::VK_CONTROL,
-            0x56
-        )
-        Start-Sleep -Milliseconds 50
-    }
-    finally {
-        if ($clipboardHadText) {
-            Set-Clipboard -Value $clipboardBackup
+            Write-Log "Navigate2 failed: $_"
         }
     }
 
-    [void][ExplorerCopyTab.NativeMethods]::SendKeyPress([ExplorerCopyTab.NativeMethods]::VK_RETURN)
+    Start-Sleep -Milliseconds $PostEnterVerifyDelayMs
+
+    $verifyContext = Get-ActiveExplorerContext
+    if ($null -eq $verifyContext) {
+        Write-Log "Post-enter verification: no active Explorer context."
+    }
+    else {
+        Write-Log "Post-enter verification: hwnd=$($verifyContext.Hwnd.ToInt64()) path=$($verifyContext.Path)"
+    }
 }
 
 function Wait-ForHotKeyRelease {
     param(
+        [int[]]$Keys = @(0x11, 0x12, 0x10),
         [int]$TimeoutMs = 1500
     )
 
-    $keys = @(0x11, 0x12, 0x10, 0x44)
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($stopwatch.ElapsedMilliseconds -lt $TimeoutMs) {
         $pressed = $false
@@ -483,7 +577,7 @@ try {
             continue
         }
 
-        if (-not (Wait-ForHotKeyRelease)) {
+        if (-not (Wait-ForHotKeyRelease -Keys @(0x11, 0x12, 0x10, [int]$resolvedHotKey.VirtualKey))) {
             Write-Log "HotKey release wait timed out. Proceeding anyway."
         }
         else {
