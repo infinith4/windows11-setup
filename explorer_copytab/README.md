@@ -125,5 +125,5 @@ powershell.exe -ExecutionPolicy Bypass -File .\explorer_copytab.ps1 -PostHotKeyC
 1. Explorer を開く
 2. 複製したいタブを前面にする
 3. `explorer_copytab.ps1` を起動する
-4. `Ctrl+Alt+Shift+D` を押して離す
+4. `Alt+Shift+Z` を押して離す
 5. 同じ場所の新しいタブが開くことを確認する

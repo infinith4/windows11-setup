@@ -32,7 +32,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Principal $principal `
     -Settings $settings `
-    -Description "Launch explorer_copytab.ps1 at logon to duplicate the active Windows Explorer tab with Ctrl+Alt+Shift+D." `
+    -Description "Launch explorer_copytab.ps1 at logon to duplicate the active Windows Explorer tab with Alt+Shift+Z." `
     -Force | Out-Null
 
 Write-Host "Registered scheduled task $taskName"
